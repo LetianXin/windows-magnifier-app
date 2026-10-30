@@ -4,7 +4,7 @@
 
 namespace {
 constexpr char shader[]=R"(
-cbuffer Viewport : register(b0) { float4 crop; float4 orientation; };
+cbuffer Viewport : register(b0) { float4 crop; };
 struct V { float4 position:SV_POSITION; float2 uv:TEXCOORD0; };
 V VS(uint id:SV_VertexID) {
     V o; float2 uv=float2((id<<1)&2,id&2);
@@ -13,16 +13,12 @@ V VS(uint id:SV_VertexID) {
 }
 Texture2D screenImage:register(t0); SamplerState sampling:register(s0);
 float4 PS(V input):SV_TARGET {
-    float2 uv=input.uv;
-    if(orientation.x==2)uv=float2(uv.y,1-uv.x);
-    else if(orientation.x==3)uv=1-uv;
-    else if(orientation.x==4)uv=float2(1-uv.y,uv.x);
-    return screenImage.Sample(sampling,uv);
+    return screenImage.Sample(sampling,input.uv);
 })";
 }
 bool Renderer::open(HWND host,RECT monitor,bool diagnostic){
     close();bounds=monitor;
-    // Windows 10 2004+ excludes this window from desktop duplication. No hide /
+    // Windows 10 2004+ excludes this window from capture. No hide /
     // recapture / show loop is ever used, and no pointer shape is composited.
     if(!SetWindowDisplayAffinity(host,WDA_EXCLUDEFROMCAPTURE))return false;
     Ptr<IDXGIFactory1> factory;
@@ -37,7 +33,7 @@ bool Renderer::open(HWND host,RECT monitor,bool diagnostic){
             Ptr<IDXGIOutput> candidateOutput;
             if(FAILED(candidate->EnumOutputs(o,&candidateOutput)))break;
             DXGI_OUTPUT_DESC desc{};candidateOutput->GetDesc(&desc);
-            if(desc.Monitor==wanted){adapter=candidate;output=candidateOutput;rotation=desc.Rotation;found=true;break;}
+            if(desc.Monitor==wanted){adapter=candidate;output=candidateOutput;found=true;break;}
         }
     }
     if(!found)return false;
@@ -58,7 +54,7 @@ bool Renderer::open(HWND host,RECT monitor,bool diagnostic){
        FAILED(D3DCompile(shader,std::strlen(shader),nullptr,nullptr,nullptr,"PS","ps_4_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&ps,nullptr)))return false;
     if(FAILED(device->CreateVertexShader(vs->GetBufferPointer(),vs->GetBufferSize(),nullptr,&vertex))||
        FAILED(device->CreatePixelShader(ps->GetBufferPointer(),ps->GetBufferSize(),nullptr,&pixel)))return false;
-    D3D11_BUFFER_DESC bd{};bd.ByteWidth=32;bd.Usage=D3D11_USAGE_DEFAULT;bd.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
+    D3D11_BUFFER_DESC bd{};bd.ByteWidth=16;bd.Usage=D3D11_USAGE_DEFAULT;bd.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
     if(FAILED(device->CreateBuffer(&bd,nullptr,&constants)))return false;
     D3D11_SAMPLER_DESC ss{};ss.Filter=D3D11_FILTER_MIN_MAG_MIP_POINT;
     ss.AddressU=ss.AddressV=ss.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;ss.MaxLOD=D3D11_FLOAT32_MAX;
@@ -68,18 +64,17 @@ bool Renderer::open(HWND host,RECT monitor,bool diagnostic){
         td.Format=DXGI_FORMAT_B8G8R8A8_UNORM;td.SampleDesc.Count=1;td.Usage=D3D11_USAGE_STAGING;td.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
         if(FAILED(device->CreateTexture2D(&td,nullptr,&probeTexture)))return false;
     }
-    Ptr<IDXGIOutput1> output1;
-    if(FAILED(output.As(&output1))||FAILED(output1->DuplicateOutput(device.Get(),&duplication)))return false;
+    if(!captureSource.open(device.Get(),wanted,sd.Width,sd.Height))return false;
     // Do not show an empty overlay if the first desktop frame is unavailable.
-    for(int i=0;i<5&&!hasFrame;++i)if(capture(100)<0)return false;
+    const auto deadline=GetTickCount64()+1000;
+    while(!hasFrame&&GetTickCount64()<deadline){if(capture()<0)return false;if(!hasFrame)Sleep(2);}
     return hasFrame;
 }
-int Renderer::capture(UINT timeout){
-    DXGI_OUTDUPL_FRAME_INFO info{};Ptr<IDXGIResource> resource;
-    HRESULT hr=duplication->AcquireNextFrame(timeout,&info,&resource);
-    if(hr==DXGI_ERROR_WAIT_TIMEOUT)return 0;
-    if(FAILED(hr))return -1;
-    Ptr<ID3D11Texture2D> frame;hr=resource.As(&frame);
+int Renderer::capture(){
+    Ptr<ID3D11Texture2D> frame;
+    const int result=captureSource.next(frame);
+    if(result<=0)return result;
+    HRESULT hr=S_OK;
     if(SUCCEEDED(hr)&&!desktop){
         D3D11_TEXTURE2D_DESC td{};frame->GetDesc(&td);
         td.BindFlags=D3D11_BIND_SHADER_RESOURCE;td.Usage=D3D11_USAGE_DEFAULT;td.CPUAccessFlags=0;td.MiscFlags=0;
@@ -87,13 +82,12 @@ int Renderer::capture(UINT timeout){
         if(SUCCEEDED(hr))hr=device->CreateShaderResourceView(desktop.Get(),nullptr,&image);
     }
     if(SUCCEEDED(hr)){context->CopyResource(desktop.Get(),frame.Get());hasFrame=true;}
-    duplication->ReleaseFrame();return SUCCEEDED(hr)?1:-1;
+    captureSource.releaseFrame();return SUCCEEDED(hr)?1:-1;
 }
 bool Renderer::update(const ez::View& v){
-    if(!duplication)return false;
-    int fresh=capture(0);if(fresh<0)return false;
+    int fresh=capture();if(fresh<0)return false;
     if(!fresh&&hasView&&v.scale==previous.scale&&v.x==previous.x&&v.y==previous.y)return true;
-    float values[8]={float(v.x/v.width),float(v.y/v.height),float(1/v.scale),float(1/v.scale),float(rotation),0,0,0};
+    float values[4]={float(v.x/v.width),float(v.y/v.height),float(1/v.scale),float(1/v.scale)};
     context->UpdateSubresource(constants.Get(),0,nullptr,values,0,0);
     ID3D11RenderTargetView* rt=target.Get();context->OMSetRenderTargets(1,&rt,nullptr);
     D3D11_VIEWPORT viewport{0,0,float(v.width),float(v.height),0,1};context->RSSetViewports(1,&viewport);
@@ -116,7 +110,7 @@ COLORREF Renderer::probe(){
     auto* p=static_cast<const BYTE*>(mapped.pData);COLORREF result=RGB(p[2],p[1],p[0]);context->Unmap(probeTexture.Get(),0);return result;
 }
 void Renderer::close(){
-    duplication.Reset();
+    captureSource.close();
     if(context){context->ClearState();context->Flush();}
     image.Reset();desktop.Reset();target.Reset();backBuffer.Reset();probeTexture.Reset();
     constants.Reset();sampler.Reset();vertex.Reset();pixel.Reset();swap.Reset();context.Reset();device.Reset();

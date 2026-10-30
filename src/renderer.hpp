@@ -6,6 +6,7 @@
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 #include "view.hpp"
+#include "capture.hpp"
 
 // Capture and presentation stay on the GPU. A complete frame remains visible
 // until its replacement is ready; there are no layered-window repaint cycles.
@@ -13,7 +14,7 @@ class Renderer {
     template<class T> using Ptr=Microsoft::WRL::ComPtr<T>;
     Ptr<ID3D11Device> device;
     Ptr<ID3D11DeviceContext> context;
-    Ptr<IDXGIOutputDuplication> duplication;
+    Capture captureSource;
     Ptr<IDXGISwapChain1> swap;
     Ptr<ID3D11Texture2D> desktop,backBuffer,probeTexture;
     Ptr<ID3D11ShaderResourceView> image;
@@ -23,14 +24,14 @@ class Renderer {
     Ptr<ID3D11SamplerState> sampler;
     Ptr<ID3D11Buffer> constants;
     RECT bounds{};
-    DXGI_MODE_ROTATION rotation=DXGI_MODE_ROTATION_IDENTITY;
     ez::View previous{};
     bool hasView=false,hasFrame=false;
-    int capture(UINT timeout);
+    int capture();
 public:
     bool open(HWND host,RECT monitor,bool diagnostic=false);
     bool update(const ez::View& view);
     COLORREF probe(); // Explicit diagnostic only; never used in ordinary operation.
+    bool cursorExcluded()const{return captureSource.cursorExcluded();}
     void close();
     ~Renderer(){close();}
 };

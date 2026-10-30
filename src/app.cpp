@@ -27,6 +27,7 @@ bool active=false,clipped=false,trayAdded=false;
 bool enabled=true;
 int binding=0;UINT taskbarCreated=0;std::wstring config;
 bool smoke=false,smokePass=false,renderHealthy=false;
+bool cursorCaptureDisabled=false;
 unsigned smokeChecks=0;COLORREF firstProbe=CLR_INVALID,secondProbe=CLR_INVALID;
 ULONGLONG smokeStarted=0;unsigned frameSamples=0,badFrames=0;
 
@@ -59,6 +60,7 @@ bool start(bool test=false){
     if(!renderer.open(overlay,monitorBounds,test)){
         renderer.close();fixture.close();MessageBoxW(settings,L"Live desktop capture could not start. Windows 10 version 2004 or newer and a compatible display driver are required.",L"EdgeZoom",MB_OK|MB_ICONERROR);return false;
     }
+    cursorCaptureDisabled=renderer.cursorExcluded();
     view={double(w),double(h),1,0,0};lastPointer={p.x-monitorBounds.left,p.y-monitorBounds.top};
     RAWINPUTDEVICE raw{1,2,RIDEV_INPUTSINK,overlay};
     if(!RegisterRawInputDevices(&raw,1,sizeof(raw))){renderer.close();fixture.close();return false;}
@@ -206,10 +208,10 @@ LRESULT CALLBACK SettingsProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
             smokeChecks|=(!active&&EqualRect(&clip,&oldClip))?256:0;
         }
         if(wp==10){
-            smokePass=smokeChecks==511&&frameSamples>=10&&badFrames==0&&trayAdded;
+            smokePass=smokeChecks==511&&frameSamples>=10&&badFrames==0&&trayAdded&&cursorCaptureDisabled;
             if(smoke){
                 FILE* report=_wfopen((config+L".test.txt").c_str(),L"w");
-                if(report){fprintf(report,"Live integration test: %s\nChecks: %u / 511\nFirst rendered pixel: %06lx\nSecond rendered pixel: %06lx\nFrame samples while panning: %u\nUnexpected frames: %u\nTray icon registered: %s\n",smokePass?"PASS":"FAIL",smokeChecks,firstProbe,secondProbe,frameSamples,badFrames,trayAdded?"yes":"no");fclose(report);}
+                if(report){fprintf(report,"Live integration test: %s\nChecks: %u / 511\nFirst rendered pixel: %06lx\nSecond rendered pixel: %06lx\nFrame samples while panning: %u\nUnexpected frames: %u\nTray icon registered: %s\nCursor capture disabled (read back from session): %s\n",smokePass?"PASS":"FAIL",smokeChecks,firstProbe,secondProbe,frameSamples,badFrames,trayAdded?"yes":"no",cursorCaptureDisabled?"yes":"no");fclose(report);}
             }
             DestroyWindow(w);if(smoke)PostQuitMessage(smokePass?0:3);
         }return 0;

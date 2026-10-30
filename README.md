@@ -2,7 +2,7 @@
 
 A small native Windows app for **live screen zoom with modifier-controlled adjustment**.
 
-**[Download EdgeZoom 0.5.0 for Windows x64](https://github.com/LetianXin/windows-magnifier-app/raw/refs/heads/main/dist/EdgeZoom-v0.5.0-windows-x64.zip)**
+**[Download EdgeZoom 0.5.1 for Windows x64](https://github.com/LetianXin/windows-magnifier-app/raw/refs/heads/main/dist/EdgeZoom-v0.5.1-windows-x64.zip)**
 
 Unzip and run `EdgeZoom.exe`. No installation or administrator access is required. The executable is unsigned. [SHA-256 checksums](dist/SHA256SUMS.txt) are provided for the ZIP and its executable.
 
@@ -23,11 +23,11 @@ The small magnifying-glass icon stays in the Windows notification area while the
 - Live magnification on the monitor under the pointer.
 - Pointer-anchored wheel zoom and movement-driven edge panning.
 - Customizable hold button, saved beside the executable.
-- Portable native C++17 app using Win32, DXGI desktop capture, and a small Direct3D 11 renderer.
+- Portable native C++17 app using Win32, Windows Graphics Capture, and a small Direct3D 11 renderer. Cursor capture is explicitly disabled, leaving only the normal Windows pointer.
 
 The overlay is for inspection: return to 100% or press Escape before clicking or typing into the underlying app. There are currently no screenshot export, annotation, or recording tools. Absolute-position tablets are not supported for edge pushing. Protected content and secure desktop screens may not appear; HDR color management is not provided.
 
-Requires Windows 10 version 2004 or newer / Windows 11 **x64**, and a compatible display driver. The renderer uses a two-buffer swap chain and retains a complete frame until its replacement is ready. The overlay is excluded from capture to prevent recursion. It does not use the repeatedly repainted Windows magnifier control from version 0.3.
+Requires Windows 10 version 2004 or newer / Windows 11 **x64**, and a compatible display driver. The renderer uses a two-buffer swap chain and retains a complete frame until its replacement is ready. The overlay is excluded from capture to prevent recursion. Windows may show its capture indicator while zoom is active. The app does not use the repeatedly repainted Windows magnifier control from version 0.3.
 
 ## Privacy
 
@@ -61,7 +61,8 @@ For a local live-rendering integration test, quit any existing instance, then ru
 | --- | --- |
 | `src/app.cpp` | Tray, settings, activation and input handling |
 | `src/view.hpp` | Zoom bounds, pointer anchoring and edge-push math |
-| `src/renderer.*` | GPU capture and double-buffered presentation |
+| `src/capture.*` | Live Windows capture with cursor inclusion disabled |
+| `src/renderer.*` | GPU scaling and double-buffered presentation |
 | `tests/` | Movement tests and live-display test source |
 | `dist/` | Tested portable Windows build and checksums |
 
