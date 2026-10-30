@@ -18,9 +18,14 @@ int main(){
  assert(ez::edgePush(1919,1918,1920,-1)==0); // move away
  assert(ez::edgePush(0,0,1920,12)==0); // inward motion
  ez::View push{1920,1080,4,100,100};
- push.pan(ez::edgePush(1919,1919,1920,40),0);assert(push.x==110);
+ push.pan(ez::edgePush(1919,1919,1920,40),0);assert(push.x==140);
  for(int i=0;i<1000;++i)push.pan(ez::edgePush(1919,1919,1920,0),0);
- assert(push.x==110); // no drift regardless of elapsed messages
+ assert(push.x==140); // no drift regardless of elapsed messages
+ for(double scale:{2.0,4.0,8.0,16.0}){
+  ez::View originalSpeed{1920,1080,scale,100,100};
+  originalSpeed.pan(40,-20);
+  assert(originalSpeed.x==140&&originalSpeed.y==80);
+ }
  v.pan(1e9,1e9);assert(near(v.x,1440)&&near(v.y,810));
  v.pan(-1e9,-1e9);assert(v.x==0&&v.y==0);
  v.zoom(1,1800,1000);assert(v.x==0&&v.y==0&&v.scale==1);

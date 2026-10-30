@@ -39,9 +39,7 @@ public:
         return true;
     }
     void advance(){++phase;InvalidateRect(window,nullptr,FALSE);UpdateWindow(window);}
-    bool displayed(){
-        HDC dc=GetDC(nullptr);if(!dc)return false;
-        COLORREF actual=GetPixel(dc,bounds.left+32,bounds.top+32);ReleaseDC(nullptr,dc);
+    bool displayed(COLORREF actual){
         lastProbe=actual;
         COLORREF expected=color(phase);
         return actual!=CLR_INVALID&&abs(int(GetRValue(actual))-int(GetRValue(expected)))<12

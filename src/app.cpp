@@ -9,7 +9,7 @@
 
 namespace {
 constexpr UINT TRAY=WM_APP+1,ZOOM=WM_APP+2;
-constexpr int KEYBOX=101,DONE=102,QUIT=103;
+constexpr int KEYBOX=101,DONE=102,QUIT=103,PAUSE=104;
 struct Binding {const wchar_t* label;int vk;};
 constexpr Binding bindings[]={
     {L"Alt",VK_MENU},{L"Ctrl",VK_CONTROL},{L"Shift",VK_SHIFT},
@@ -24,9 +24,11 @@ Renderer renderer;ez::View view;
 LiveFixture fixture;
 RECT monitorBounds{},oldClip{};POINT lastPointer{};
 bool active=false,practice=false,clipped=false,trayAdded=false;
+bool enabled=true;
 int binding=0;UINT taskbarCreated=0;std::wstring config;
 bool smoke=false,smokePass=false,renderHealthy=false;
 unsigned smokeChecks=0;COLORREF firstProbe=CLR_INVALID,secondProbe=CLR_INVALID;
+ULONGLONG smokeStarted=0;unsigned frameSamples=0,badFrames=0;
 
 bool held(){return (GetAsyncKeyState(bindings[binding].vk)&0x8000)!=0;}
 void stop(){
@@ -55,8 +57,8 @@ bool start(bool test=false){
     const int w=monitorBounds.right-monitorBounds.left,h=monitorBounds.bottom-monitorBounds.top;
     SetWindowPos(overlay,HWND_TOPMOST,monitorBounds.left,monitorBounds.top,w,h,SWP_NOACTIVATE);
     if(test&&!fixture.open(monitorBounds,!smoke))return false;
-    if(!renderer.open(overlay,monitorBounds)){
-        fixture.close();MessageBoxW(settings,L"Windows could not start live magnification.",L"EdgeZoom",MB_OK|MB_ICONERROR);return false;
+    if(!renderer.open(overlay,monitorBounds,test)){
+        renderer.close();fixture.close();MessageBoxW(settings,L"Live desktop capture could not start. Windows 10 version 2004 or newer and a compatible display driver are required.",L"EdgeZoom",MB_OK|MB_ICONERROR);return false;
     }
     view={double(w),double(h),1,0,0};lastPointer={p.x-monitorBounds.left,p.y-monitorBounds.top};
     RAWINPUTDEVICE raw{1,2,RIDEV_INPUTSINK,overlay};
@@ -77,7 +79,7 @@ void zoom(int delta){
     view.zoom(view.scale*std::pow(1.2,double(delta)/WHEEL_DELTA),p.x,p.y);redraw();
 }
 LRESULT CALLBACK mouseProc(int code,WPARAM message,LPARAM data){
-    if(code==HC_ACTION&&message==WM_MOUSEWHEEL&&(active||held())){
+    if(!smoke&&code==HC_ACTION&&message==WM_MOUSEWHEEL&&(active||(enabled&&held()))){
         const auto* event=reinterpret_cast<const MSLLHOOKSTRUCT*>(data);
         const int delta=GET_WHEEL_DELTA_WPARAM(event->mouseData);
         if(active||delta>0){PostMessageW(settings,ZOOM,WPARAM(delta),0);return 1;}
@@ -85,7 +87,7 @@ LRESULT CALLBACK mouseProc(int code,WPARAM message,LPARAM data){
     return CallNextHookEx(mouseHook,code,message,data);
 }
 void rawMouse(HRAWINPUT handle){
-    if(!active)return;
+    if(!active||smoke)return;
     RAWINPUT raw{};UINT bytes=sizeof(raw);
     if(GetRawInputData(handle,RID_INPUT,&raw,&bytes,sizeof(RAWINPUTHEADER))!=sizeof(raw))return;
     if(raw.header.dwType!=RIM_TYPEMOUSE)return;
@@ -121,9 +123,13 @@ LRESULT CALLBACK OverlayProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
 void tray(){
     NOTIFYICONDATAW n{sizeof(n)};n.hWnd=settings;n.uID=1;n.uFlags=NIF_MESSAGE|NIF_ICON|NIF_TIP;
     n.uCallbackMessage=TRAY;n.hIcon=LoadIconW(instance,MAKEINTRESOURCEW(1));
-    swprintf_s(n.szTip,L"EdgeZoom - hold %s + scroll",bindings[binding].label);
-    if(trayAdded)Shell_NotifyIconW(NIM_MODIFY,&n);else trayAdded=Shell_NotifyIconW(NIM_ADD,&n)!=FALSE;
+    if(!n.hIcon)n.hIcon=LoadIconW(nullptr,IDI_APPLICATION);
+    swprintf_s(n.szTip,L"EdgeZoom - %s - hold %s + scroll",enabled?L"ON":L"PAUSED",bindings[binding].label);
+    if(trayAdded)trayAdded=Shell_NotifyIconW(NIM_MODIFY,&n)!=FALSE;
+    if(!trayAdded)trayAdded=Shell_NotifyIconW(NIM_ADD,&n)!=FALSE;
+    if(trayAdded){n.uVersion=NOTIFYICON_VERSION_4;Shell_NotifyIconW(NIM_SETVERSION,&n);}
 }
+void pauseZoom(){stop();enabled=!enabled;SetWindowTextW(GetDlgItem(settings,PAUSE),enabled?L"Pause":L"Resume");tray();}
 void showSettings(){stop();ShowWindow(settings,SW_SHOWNORMAL);SetForegroundWindow(settings);}
 void saveBinding(){
     int selected=int(SendMessageW(GetDlgItem(settings,KEYBOX),CB_GETCURSEL,0,0));
@@ -147,43 +153,55 @@ LRESULT CALLBACK SettingsProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
         HWND combo=control(w,L"COMBOBOX",L"",CBS_DROPDOWNLIST|WS_TABSTOP|WS_VSCROLL,20,48,350,240,KEYBOX);
         for(auto b:bindings)SendMessageW(combo,CB_ADDSTRING,0,(LPARAM)b.label);
         SendMessageW(combo,CB_SETCURSEL,binding,0);
-        control(w,L"STATIC",L"Push the mouse beyond an edge to pan.\nStop moving and panning stops.\nRelease the button to return. Esc also exits.\n\nThe screen stays live while you hold.",0,20,92,350,110,0);
-        control(w,L"BUTTON",L"Done - keep in tray",WS_TABSTOP|BS_DEFPUSHBUTTON,20,218,230,34,DONE);
-        control(w,L"BUTTON",L"Quit",WS_TABSTOP,264,218,106,34,QUIT);
+        control(w,L"STATIC",L"Push beyond an edge to pan at normal speed.\nRelease the button to return. Esc also exits.\nThe screen stays live while you hold.\n\nTray icon: Pause / Quit   |   Ctrl+Alt+Q: quit",0,20,92,350,110,0);
+        control(w,L"BUTTON",L"Done - keep in tray",WS_TABSTOP|BS_DEFPUSHBUTTON,20,218,176,34,DONE);
+        control(w,L"BUTTON",L"Pause",WS_TABSTOP,204,218,78,34,PAUSE);
+        control(w,L"BUTTON",L"Quit",WS_TABSTOP,290,218,80,34,QUIT);
         return 0;}
     case WM_COMMAND:
         if(LOWORD(wp)==KEYBOX&&HIWORD(wp)==CBN_SELCHANGE)saveBinding();
         if(LOWORD(wp)==DONE){if(trayAdded)ShowWindow(w,SW_HIDE);}
+        if(LOWORD(wp)==PAUSE)pauseZoom();
         if(LOWORD(wp)==QUIT)DestroyWindow(w);
         return 0;
     case ZOOM:zoom(int(wp));return 0;
     case TRAY:
-        if(lp==WM_LBUTTONUP)showSettings();
-        if(lp==WM_RBUTTONUP){
-            HMENU menu=CreatePopupMenu();AppendMenuW(menu,MF_STRING,DONE,L"Settings");AppendMenuW(menu,MF_STRING,QUIT,L"Quit EdgeZoom");
+        if(LOWORD(lp)==NIN_SELECT||LOWORD(lp)==NIN_KEYSELECT)showSettings();
+        if(LOWORD(lp)==WM_CONTEXTMENU){
+            HMENU menu=CreatePopupMenu();AppendMenuW(menu,MF_STRING,DONE,L"Settings");
+            AppendMenuW(menu,MF_STRING,PAUSE,enabled?L"Pause zoom":L"Resume zoom");
+            AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING,QUIT,L"Quit EdgeZoom\tCtrl+Alt+Q");
             POINT p;GetCursorPos(&p);SetForegroundWindow(w);
             UINT id=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,p.x,p.y,0,w,nullptr);DestroyMenu(menu);
-            if(id==DONE)showSettings();if(id==QUIT)DestroyWindow(w);PostMessageW(w,WM_NULL,0,0);
+            if(id==DONE)showSettings();if(id==PAUSE)pauseZoom();if(id==QUIT)DestroyWindow(w);PostMessageW(w,WM_NULL,0,0);
         }return 0;
+    case WM_HOTKEY:if(wp==1)DestroyWindow(w);return 0;
     case WM_TIMER:
         if(wp==9){KillTimer(w,9);if(start(true)){view.zoom(2,view.width/2,view.height/2);redraw();}else PostQuitMessage(2);}
+        if(wp==14&&active){
+            const auto elapsed=GetTickCount64()-smokeStarted;
+            if((elapsed>900&&elapsed<2300)||(elapsed>2800&&elapsed<4200)){
+                ++frameSamples;if(!fixture.displayed(renderer.probe()))++badFrames;
+                view.pan(3,0);redraw();
+            }
+        }
         if(wp==11){
             KillTimer(w,11);
-            smokeChecks=(active?1:0)|(renderHealthy?2:0)|(std::abs(view.scale-2)<1e-6?4:0)|(fixture.displayed()?8:0);
+            smokeChecks=(active?1:0)|(renderHealthy?2:0)|(std::abs(view.scale-2)<1e-6?4:0)|(fixture.displayed(renderer.probe())?8:0);
             firstProbe=fixture.lastProbe;
             fixture.advance(); // Change ONLY the underlying source, keeping the viewport stationary.
         }
         if(wp==12){
-            KillTimer(w,12);smokeChecks|=(active?16:0)|(fixture.displayed()?32:0);secondProbe=fixture.lastProbe;
+            KillTimer(w,12);smokeChecks|=(active?16:0)|(fixture.displayed(renderer.probe())?32:0);secondProbe=fixture.lastProbe;
             zoom(120);smokeChecks|=std::abs(view.scale-2.4)<1e-6?64:0;
             practice=false; // Exercise the real release timer with no activation key held.
         }
         if(wp==13){KillTimer(w,13);RECT clip{};GetClipCursor(&clip);smokeChecks|=(!active?128:0)|(EqualRect(&clip,&oldClip)?256:0);}
         if(wp==10){
-            smokePass=smokeChecks==511;
+            smokePass=smokeChecks==511&&frameSamples>=10&&badFrames==0&&trayAdded;
             if(smoke){
                 FILE* report=_wfopen((config+L".test.txt").c_str(),L"w");
-                if(report){fprintf(report,"Live integration test: %s\nChecks: %u / 511\nFirst displayed pixel: %06lx\nSecond displayed pixel: %06lx\n",smokePass?"PASS":"FAIL",smokeChecks,firstProbe,secondProbe);fclose(report);}
+                if(report){fprintf(report,"Live integration test: %s\nChecks: %u / 511\nFirst rendered pixel: %06lx\nSecond rendered pixel: %06lx\nFrame samples while panning: %u\nUnexpected frames: %u\nTray icon registered: %s\n",smokePass?"PASS":"FAIL",smokeChecks,firstProbe,secondProbe,frameSamples,badFrames,trayAdded?"yes":"no");fclose(report);}
             }
             DestroyWindow(w);if(smoke)PostQuitMessage(smokePass?0:3);
         }return 0;
@@ -192,6 +210,7 @@ LRESULT CALLBACK SettingsProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
     case WM_CLOSE:if(trayAdded)ShowWindow(w,SW_HIDE);else DestroyWindow(w);return 0;
     case WM_DESTROY:{
         stop();if(mouseHook){UnhookWindowsHookEx(mouseHook);mouseHook=nullptr;}
+        UnregisterHotKey(w,1);
         NOTIFYICONDATAW n{sizeof(n)};n.hWnd=w;n.uID=1;Shell_NotifyIconW(NIM_DELETE,&n);PostQuitMessage(0);return 0;}
     }
     return DefWindowProcW(w,m,wp,lp);
@@ -221,18 +240,19 @@ int WINAPI wWinMain(HINSTANCE h,HINSTANCE,PWSTR args,int){
     RECT rect{0,0,MulDiv(390,dpi,96),MulDiv(274,dpi,96)};AdjustWindowRectEx(&rect,style,FALSE,0);
     settings=CreateWindowExW(0,L"EdgeZoomSettings",L"EdgeZoom settings",style,CW_USEDEFAULT,CW_USEDEFAULT,
         rect.right-rect.left,rect.bottom-rect.top,nullptr,nullptr,h,nullptr);
-    const DWORD overlayStyle=WS_EX_TOPMOST|WS_EX_LAYERED|(wcsstr(args,L"--demo")?WS_EX_APPWINDOW:WS_EX_TOOLWINDOW);
+    const DWORD overlayStyle=WS_EX_TOPMOST|(wcsstr(args,L"--demo")?WS_EX_APPWINDOW:WS_EX_TOOLWINDOW);
     overlay=CreateWindowExW(overlayStyle,L"EdgeZoomOverlay",L"EdgeZoom",WS_POPUP|WS_CLIPCHILDREN,0,0,1,1,nullptr,nullptr,h,nullptr);
     if(!settings||!overlay)return 1;
-    if(!SetLayeredWindowAttributes(overlay,0,255,LWA_ALPHA))return 1;
     mouseHook=SetWindowsHookExW(WH_MOUSE_LL,mouseProc,h,0);
     if(!mouseHook){MessageBoxW(settings,L"Could not register the mouse-wheel shortcut.",L"EdgeZoom",MB_OK|MB_ICONERROR);return 1;}
     taskbarCreated=RegisterWindowMessageW(L"TaskbarCreated");tray();
+    RegisterHotKey(settings,1,MOD_CONTROL|MOD_ALT|MOD_NOREPEAT,'Q');
     if(!wcsstr(args,L"--tray")||!trayAdded){ShowWindow(settings,SW_SHOWNORMAL);UpdateWindow(settings);}
     if(wcsstr(args,L"--demo")||wcsstr(args,L"--smoke-test"))SetTimer(settings,9,350,nullptr);
     if(wcsstr(args,L"--smoke-test")){
-        smoke=true;SetTimer(settings,11,900,nullptr);SetTimer(settings,12,1500,nullptr);
-        SetTimer(settings,13,1900,nullptr);SetTimer(settings,10,2200,nullptr);
+        smoke=true;SetTimer(settings,11,2500,nullptr);SetTimer(settings,12,4400,nullptr);
+        SetTimer(settings,13,4800,nullptr);SetTimer(settings,10,5100,nullptr);
+        smokeStarted=GetTickCount64();SetTimer(settings,14,7,nullptr);
     }
     MSG msg{};BOOL result;
     while((result=GetMessageW(&msg,nullptr,0,0))>0){

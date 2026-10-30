@@ -17,7 +17,8 @@ struct View {
         scale=std::clamp(next,1.0,16.0);
         x=sx-px/scale; y=sy-py/scale; clamp();
     }
-    void pan(double dx,double dy) { x+=dx/scale; y+=dy/scale; clamp(); }
+    // Edge motion is in original-desktop pixels, independent of magnification.
+    void pan(double dx,double dy) { x+=dx; y+=dy; clamp(); }
 };
 // Pan only on outward motion AFTER arriving at an edge; never on a timer.
 inline double edgePush(double previous,double current,double extent,double delta) {
