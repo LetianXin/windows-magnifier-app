@@ -3,7 +3,8 @@
 #define NOMINMAX
 #include <windows.h>
 #include <d3d11.h>
-#include <dxgi1_2.h>
+#include <dxgi1_3.h>
+#include <dcomp.h>
 #include <wrl/client.h>
 #include "view.hpp"
 #include "capture.hpp"
@@ -16,6 +17,10 @@ class Renderer {
     Ptr<ID3D11DeviceContext> context;
     Capture captureSource;
     Ptr<IDXGISwapChain1> swap;
+    Ptr<IDCompositionDevice> composition;
+    Ptr<IDCompositionTarget> compositionTarget;
+    Ptr<IDCompositionVisual> compositionVisual;
+    HANDLE frameReady=nullptr;
     Ptr<ID3D11Texture2D> desktop,backBuffer,probeTexture;
     Ptr<ID3D11ShaderResourceView> image;
     Ptr<ID3D11RenderTargetView> target;
@@ -26,9 +31,13 @@ class Renderer {
     RECT bounds{};
     ez::View previous{};
     bool hasView=false,hasFrame=false;
+    bool pending=false;
     int capture();
 public:
-    bool open(HWND host,RECT monitor,bool diagnostic=false);
+    bool open(HWND host,RECT monitor,bool diagnostic=false,bool begin=true);
+    bool beginCapture();
+    void endCapture();
+    bool ready()const{return hasView;}
     bool update(const ez::View& view);
     COLORREF probe(); // Explicit diagnostic only; never used in ordinary operation.
     bool cursorExcluded()const{return captureSource.cursorExcluded();}

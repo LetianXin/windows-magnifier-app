@@ -1,4 +1,6 @@
 #include "renderer.hpp"
+#include "input.hpp"
+#include "pointer.hpp"
 #include <windowsx.h>
 #include <shellapi.h>
 #include <dwmapi.h>
@@ -8,7 +10,7 @@
 #include "../tests/live_fixture.hpp"
 
 namespace {
-constexpr UINT TRAY=WM_APP+1,ZOOM=WM_APP+2;
+constexpr UINT TRAY=WM_APP+1,ZOOM=WM_APP+2,STOP=WM_APP+3;
 constexpr int KEYBOX=101,DONE=102,QUIT=103,PAUSE=104;
 struct Binding {const wchar_t* label;int vk;};
 constexpr Binding bindings[]={
@@ -19,10 +21,12 @@ constexpr Binding bindings[]={
     {L"F5",VK_F5},{L"F6",VK_F6},{L"F7",VK_F7},{L"F8",VK_F8},
     {L"F9",VK_F9},{L"F10",VK_F10},{L"F11",VK_F11},{L"F12",VK_F12}};
 HINSTANCE instance;HWND settings=nullptr,overlay=nullptr,previousWindow=nullptr;
-HFONT font=nullptr;HHOOK mouseHook=nullptr;
+HFONT font=nullptr;InputRouter input;PointerVisual pointer;
 Renderer renderer;ez::View view;
 LiveFixture fixture;
-RECT monitorBounds{},oldClip{};POINT lastPointer{};
+RECT monitorBounds{},oldClip{},warmBounds{};
+bool warm=false,visible=false,diagnostic=false;
+ULONGLONG captureStarted=0,firstFrameMs=0;
 bool active=false,clipped=false,trayAdded=false;
 bool enabled=true;
 int binding=0;UINT taskbarCreated=0;std::wstring config;
@@ -30,21 +34,51 @@ bool smoke=false,smokePass=false,renderHealthy=false;
 bool cursorCaptureDisabled=false;
 unsigned smokeChecks=0;COLORREF firstProbe=CLR_INVALID,secondProbe=CLR_INVALID;
 ULONGLONG smokeStarted=0;unsigned frameSamples=0,badFrames=0;
+ULONGLONG sourceChanged=0,changeLatency=0;bool inputPass=false;
+POINT mappedBefore{},mappedAfter{};
+// Explicit test mode only: generated events target our own fullscreen fixture.
+// Abort injection if the user has switched to any other application.
+bool fixtureMouse(DWORD flags,DWORD data=0,LONG dx=0,LONG dy=0){
+    if(!fixture.ownsForeground())return false;
+    INPUT event{};event.type=INPUT_MOUSE;event.mi.dwFlags=flags;
+    event.mi.mouseData=data;event.mi.dx=dx;event.mi.dy=dy;
+    return SendInput(1,&event,sizeof(event))==1;
+}
 
-bool held(){return (GetAsyncKeyState(bindings[binding].vk)&0x8000)!=0;}
 void stop(){
     if(!active)return;
     active=false;KillTimer(overlay,1);
-    RAWINPUTDEVICE raw{1,2,RIDEV_REMOVE,nullptr};RegisterRawInputDevices(&raw,1,sizeof(raw));
+    input.end();pointer.hide();visible=false;
     if(clipped){ClipCursor(&oldClip);clipped=false;}
     const bool restore=GetForegroundWindow()==overlay;
-    ShowWindow(overlay,SW_HIDE);renderer.close();fixture.close();
+    ShowWindow(overlay,SW_HIDE);renderer.endCapture();fixture.close();
     if(restore&&IsWindow(previousWindow))SetForegroundWindow(previousWindow);
 }
 void redraw(){
-    wchar_t title[100];swprintf_s(title,L"EdgeZoom - %.2fx",view.scale);
-    SetWindowTextW(overlay,title);
-    if(active){renderHealthy=renderer.update(view);if(!renderHealthy)stop();}
+    if(!active)return;
+    POINT position{};
+    if(!smoke){auto state=input.snapshot();view=state.view;position=state.pointer;}
+    renderHealthy=renderer.update(view);
+    if(!renderHealthy){stop();return;}
+    if(!renderer.ready()){
+        if(GetTickCount64()-captureStarted>2000)stop();
+        return;
+    }
+    if(!visible){
+        firstFrameMs=GetTickCount64()-captureStarted;
+        if(!pointer.open(instance)){stop();return;}
+        SetWindowPos(overlay,HWND_TOPMOST,monitorBounds.left,monitorBounds.top,
+            int(view.width),int(view.height),SWP_SHOWWINDOW|SWP_NOACTIVATE);
+        visible=true;
+    }
+    position.x+=monitorBounds.left;position.y+=monitorBounds.top;
+    if(!pointer.update(position))stop();
+}
+void warmRenderer(){
+    POINT p{};GetCursorPos(&p);MONITORINFO mi{sizeof(mi)};
+    if(!GetMonitorInfoW(MonitorFromPoint(p,MONITOR_DEFAULTTONEAREST),&mi))return;
+    warmBounds=mi.rcMonitor;
+    warm=renderer.open(overlay,warmBounds,false,false);diagnostic=false;
 }
 bool start(bool test=false){
     if(active)return true;
@@ -57,74 +91,42 @@ bool start(bool test=false){
     const int w=monitorBounds.right-monitorBounds.left,h=monitorBounds.bottom-monitorBounds.top;
     SetWindowPos(overlay,HWND_TOPMOST,monitorBounds.left,monitorBounds.top,w,h,SWP_NOACTIVATE);
     if(test&&!fixture.open(monitorBounds,!smoke))return false;
-    if(!renderer.open(overlay,monitorBounds,test)){
-        renderer.close();fixture.close();MessageBoxW(settings,L"Live desktop capture could not start. Windows 10 version 2004 or newer and a compatible display driver are required.",L"EdgeZoom",MB_OK|MB_ICONERROR);return false;
+    captureStarted=GetTickCount64();
+    const bool reused=warm&&EqualRect(&warmBounds,&monitorBounds)&&diagnostic==test;
+    const bool opened=reused?renderer.beginCapture():renderer.open(overlay,monitorBounds,test);
+    if(!opened){
+        warm=false;renderer.close();fixture.close();MessageBoxW(settings,L"Live desktop capture could not start. Windows 10 version 2004 or newer and a compatible display driver are required.",L"EdgeZoom",MB_OK|MB_ICONERROR);return false;
     }
     cursorCaptureDisabled=renderer.cursorExcluded();
-    view={double(w),double(h),1,0,0};lastPointer={p.x-monitorBounds.left,p.y-monitorBounds.top};
-    RAWINPUTDEVICE raw{1,2,RIDEV_INPUTSINK,overlay};
-    if(!RegisterRawInputDevices(&raw,1,sizeof(raw))){renderer.close();fixture.close();return false;}
+    warm=true;warmBounds=monitorBounds;diagnostic=test;
+    view={double(w),double(h),1,0,0};
+    if(!smoke)input.begin(view,monitorBounds,p);
     clipped=GetClipCursor(&oldClip)&&ClipCursor(&monitorBounds);
-    active=true;
-    renderHealthy=renderer.update(view);
-    if(!renderHealthy){stop();return false;}
-    SetWindowPos(overlay,HWND_TOPMOST,monitorBounds.left,monitorBounds.top,w,h,SWP_SHOWWINDOW);
-    SetForegroundWindow(overlay);SetFocus(overlay);
-    SetTimer(overlay,1,16,nullptr);return active;
+    active=true;visible=false;
+    SetTimer(overlay,1,8,nullptr);return true;
 }
 void zoom(int delta){
-    if(!active&&(!held()||delta<=0))return;
+    // The event was already authorized by the hook when the wheel moved.
+    if(!enabled||(!active&&delta<=0))return;
     if(!start())return;
-    POINT p;GetCursorPos(&p);ScreenToClient(overlay,&p);
-    // Immediate pointer-anchored zoom: no easing, timer scrolling, or inertia.
-    view.zoom(view.scale*std::pow(1.2,double(delta)/WHEEL_DELTA),p.x,p.y);
+    if(smoke)view.zoom(view.scale*std::pow(1.2,double(delta)/WHEEL_DELTA),view.width/2,view.height/2);
+    else {input.zoom(delta);view=input.snapshot().view;}
     if(view.scale<=1){stop();return;}
     redraw();
-}
-LRESULT CALLBACK mouseProc(int code,WPARAM message,LPARAM data){
-    // The modifier gates wheel zoom only. Releasing it leaves the viewport active.
-    if(!smoke&&code==HC_ACTION&&message==WM_MOUSEWHEEL&&enabled&&held()){
-        const auto* event=reinterpret_cast<const MSLLHOOKSTRUCT*>(data);
-        const int delta=GET_WHEEL_DELTA_WPARAM(event->mouseData);
-        if(active||delta>0)PostMessageW(settings,ZOOM,WPARAM(delta),0);
-        return 1;
-    }
-    return CallNextHookEx(mouseHook,code,message,data);
-}
-void rawMouse(HRAWINPUT handle){
-    if(!active||smoke)return;
-    RAWINPUT raw{};UINT bytes=sizeof(raw);
-    if(GetRawInputData(handle,RID_INPUT,&raw,&bytes,sizeof(RAWINPUTHEADER))!=sizeof(raw))return;
-    if(raw.header.dwType!=RIM_TYPEMOUSE)return;
-    POINT p;GetCursorPos(&p);ScreenToClient(overlay,&p);
-    if(!(raw.data.mouse.usFlags&MOUSE_MOVE_ABSOLUTE)){
-        const double dx=ez::edgePush(lastPointer.x,p.x,view.width,raw.data.mouse.lLastX);
-        const double dy=ez::edgePush(lastPointer.y,p.y,view.height,raw.data.mouse.lLastY);
-        if(dx||dy){const double x=view.x,y=view.y;view.pan(dx,dy);if(x!=view.x||y!=view.y)redraw();}
-    }
-    lastPointer=p;
 }
 LRESULT CALLBACK OverlayProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
     switch(m){
     case WM_ERASEBKGND:return 1;
     case WM_PAINT:{PAINTSTRUCT p;BeginPaint(w,&p);EndPaint(w,&p);return 0;}
-    case WM_INPUT:rawMouse(reinterpret_cast<HRAWINPUT>(lp));return DefWindowProcW(w,m,wp,lp);
-    case WM_TIMER:
-        if(active){renderHealthy=renderer.update(view);if(!renderHealthy)stop();}
-        return 0;
-    case WM_KEYDOWN:case WM_SYSKEYDOWN:
-        if(wp==VK_ESCAPE){stop();return 0;}
-        // Normal system switching remains available while inspecting.
-        if(wp==VK_TAB){stop();return DefWindowProcW(w,m,wp,lp);}
-        return 0;
-    case WM_KEYUP:case WM_SYSKEYUP:return 0;
-    case WM_ACTIVATE:if(LOWORD(wp)==WA_INACTIVE&&active)stop();return 0;
+    case WM_TIMER:redraw();return 0;
+    case WM_MOUSEACTIVATE:return MA_NOACTIVATE;
+    case WM_NCHITTEST:return HTTRANSPARENT;
     case WM_DISPLAYCHANGE:case WM_CLOSE:stop();return 0;
-    case WM_SETCURSOR:SetCursor(LoadCursorW(nullptr,IDC_ARROW));return TRUE;
     }
     return DefWindowProcW(w,m,wp,lp);
 }
 void tray(){
+    input.configure(enabled&&!smoke,bindings[binding].vk);
     NOTIFYICONDATAW n{sizeof(n)};n.hWnd=settings;n.uID=1;n.uFlags=NIF_MESSAGE|NIF_ICON|NIF_TIP;
     n.uCallbackMessage=TRAY;n.hIcon=LoadIconW(instance,MAKEINTRESOURCEW(1));
     if(!n.hIcon)n.hIcon=LoadIconW(nullptr,IDI_APPLICATION);
@@ -169,6 +171,7 @@ LRESULT CALLBACK SettingsProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
         if(LOWORD(wp)==QUIT)DestroyWindow(w);
         return 0;
     case ZOOM:zoom(int(wp));return 0;
+    case STOP:stop();return 0;
     case TRAY:
         if(LOWORD(lp)==NIN_SELECT||LOWORD(lp)==NIN_KEYSELECT)showSettings();
         if(LOWORD(lp)==WM_CONTEXTMENU){
@@ -181,19 +184,21 @@ LRESULT CALLBACK SettingsProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
         }return 0;
     case WM_HOTKEY:if(wp==1)DestroyWindow(w);return 0;
     case WM_TIMER:
-        if(wp==9){KillTimer(w,9);if(start(true)){view.zoom(2,view.width/2,view.height/2);redraw();}else PostQuitMessage(2);}
+        if(wp==20){KillTimer(w,20);if(!active)warmRenderer();}
+        if(wp==9){KillTimer(w,9);if(start(true)){view.zoom(2,view.width/2,view.height/2);if(!smoke)input.setView(view);redraw();}else PostQuitMessage(2);}
         if(wp==14&&active){
+            if(sourceChanged&&!changeLatency&&fixture.displayed(renderer.probe()))changeLatency=GetTickCount64()-sourceChanged;
             const auto elapsed=GetTickCount64()-smokeStarted;
             if((elapsed>900&&elapsed<2300)||(elapsed>2800&&elapsed<4200)){
                 ++frameSamples;if(!fixture.displayed(renderer.probe()))++badFrames;
-                view.pan(3,0);redraw();
+                if(elapsed<3200||elapsed>4000)view.pan(3,0);redraw();
             }
         }
         if(wp==11){
             KillTimer(w,11);
             smokeChecks=(active?1:0)|(renderHealthy?2:0)|(std::abs(view.scale-2)<1e-6?4:0)|(fixture.displayed(renderer.probe())?8:0);
             firstProbe=fixture.lastProbe;
-            fixture.advance(); // Change ONLY the underlying source, keeping the viewport stationary.
+            sourceChanged=GetTickCount64();fixture.advance(); // Change ONLY the underlying source, keeping the viewport stationary.
         }
         if(wp==12){
             KillTimer(w,12);smokeChecks|=(active?16:0)|(fixture.displayed(renderer.probe())?32:0);secondProbe=fixture.lastProbe;
@@ -207,11 +212,46 @@ LRESULT CALLBACK SettingsProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
             zoom(-2400);RECT clip{};GetClipCursor(&clip);
             smokeChecks|=(!active&&EqualRect(&clip,&oldClip))?256:0;
         }
+        if(wp==15){
+            KillTimer(w,15);
+            // Verify native dispatch through the overlay using only our fixture.
+            SetForegroundWindow(fixture.handle());SetFocus(fixture.handle());
+            POINT p{monitorBounds.left+int(view.width/2),monitorBounds.top+int(view.height/2)};
+            input.begin(view,monitorBounds,p);input.setView(view);
+        }
+        if(wp==16){
+            KillTimer(w,16);GetCursorPos(&mappedBefore);
+            fixtureMouse(MOUSEEVENTF_LEFTDOWN);
+        }
+        if(wp==17){KillTimer(w,17);fixtureMouse(MOUSEEVENTF_MOVE,0,40,0);}
+        if(wp==18){
+            KillTimer(w,18);GetCursorPos(&mappedAfter);
+            fixtureMouse(MOUSEEVENTF_LEFTUP);
+            fixtureMouse(MOUSEEVENTF_RIGHTDOWN);fixtureMouse(MOUSEEVENTF_RIGHTUP);
+            fixtureMouse(MOUSEEVENTF_MIDDLEDOWN);fixtureMouse(MOUSEEVENTF_MIDDLEUP);
+            fixtureMouse(MOUSEEVENTF_XDOWN,XBUTTON1);fixtureMouse(MOUSEEVENTF_XUP,XBUTTON1);
+            fixtureMouse(MOUSEEVENTF_WHEEL,WHEEL_DELTA);fixtureMouse(MOUSEEVENTF_HWHEEL,WHEEL_DELTA);
+            if(fixture.ownsForeground()){
+                INPUT keys[2]{};keys[0].type=keys[1].type=INPUT_KEYBOARD;
+                keys[0].ki.wScan=keys[1].ki.wScan='x';keys[0].ki.dwFlags=KEYEVENTF_UNICODE;
+                keys[1].ki.dwFlags=KEYEVENTF_UNICODE|KEYEVENTF_KEYUP;SendInput(2,keys,sizeof(INPUT));
+            }
+        }
+        if(wp==19){
+            KillTimer(w,19);auto moved=input.snapshot();
+            const double expected=monitorBounds.left+moved.view.x+moved.pointer.x/moved.view.scale;
+            inputPass=fixture.leftDown==1&&fixture.leftUp==1&&fixture.dragged&&fixture.rightDown==1&&
+                fixture.middleDown==1&&fixture.sideDown==1&&fixture.wheel==120&&fixture.horizontal==120&&
+                fixture.typed==1&&abs(mappedAfter.x-expected)<=1&&mappedAfter.x>mappedBefore.x&&
+                fixture.ownsForeground();
+            input.end();
+        }
         if(wp==10){
-            smokePass=smokeChecks==511&&frameSamples>=10&&badFrames==0&&trayAdded&&cursorCaptureDisabled;
+            smokePass=smokeChecks==511&&frameSamples>=10&&badFrames==0&&trayAdded&&cursorCaptureDisabled&&inputPass&&changeLatency>0&&changeLatency<250;
             if(smoke){
                 FILE* report=_wfopen((config+L".test.txt").c_str(),L"w");
-                if(report){fprintf(report,"Live integration test: %s\nChecks: %u / 511\nFirst rendered pixel: %06lx\nSecond rendered pixel: %06lx\nFrame samples while panning: %u\nUnexpected frames: %u\nTray icon registered: %s\nCursor capture disabled (read back from session): %s\n",smokePass?"PASS":"FAIL",smokeChecks,firstProbe,secondProbe,frameSamples,badFrames,trayAdded?"yes":"no",cursorCaptureDisabled?"yes":"no");fclose(report);}
+                if(report){fprintf(report,"Live integration test: %s\nChecks: %u / 511\nFirst rendered pixel: %06lx\nSecond rendered pixel: %06lx\nFrame samples while panning: %u\nUnexpected frames: %u\nTray icon registered: %s\nCursor capture disabled (read back from session): %s\n",smokePass?"PASS":"FAIL",smokeChecks,firstProbe,secondProbe,frameSamples,badFrames,trayAdded?"yes":"no",cursorCaptureDisabled?"yes":"no");
+                    fprintf(report,"Native click/drag/buttons/wheel/typing test: %s\nInitial first frame: %llu ms\nSource change to rendered frame: %llu ms\nInput counts: left %u/%u, right %u, middle %u, side %u, wheel %d/%d, typed %u, drag %d\nMapped move: %ld -> %ld\n",inputPass?"PASS":"FAIL",firstFrameMs,changeLatency,fixture.leftDown,fixture.leftUp,fixture.rightDown,fixture.middleDown,fixture.sideDown,fixture.wheel,fixture.horizontal,fixture.typed,int(fixture.dragged),mappedBefore.x,mappedAfter.x);fclose(report);}
             }
             DestroyWindow(w);if(smoke)PostQuitMessage(smokePass?0:3);
         }return 0;
@@ -219,7 +259,7 @@ LRESULT CALLBACK SettingsProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
     case WM_DISPLAYCHANGE:stop();return 0;
     case WM_CLOSE:if(trayAdded)ShowWindow(w,SW_HIDE);else DestroyWindow(w);return 0;
     case WM_DESTROY:{
-        stop();if(mouseHook){UnhookWindowsHookEx(mouseHook);mouseHook=nullptr;}
+        stop();input.close();
         UnregisterHotKey(w,1);
         NOTIFYICONDATAW n{sizeof(n)};n.hWnd=w;n.uID=1;Shell_NotifyIconW(NIM_DELETE,&n);PostQuitMessage(0);return 0;}
     }
@@ -250,26 +290,32 @@ int WINAPI wWinMain(HINSTANCE h,HINSTANCE,PWSTR args,int){
     RECT rect{0,0,MulDiv(390,dpi,96),MulDiv(274,dpi,96)};AdjustWindowRectEx(&rect,style,FALSE,0);
     settings=CreateWindowExW(0,L"EdgeZoomSettings",L"EdgeZoom settings",style,CW_USEDEFAULT,CW_USEDEFAULT,
         rect.right-rect.left,rect.bottom-rect.top,nullptr,nullptr,h,nullptr);
-    const DWORD overlayStyle=WS_EX_TOPMOST|(wcsstr(args,L"--demo")?WS_EX_APPWINDOW:WS_EX_TOOLWINDOW);
+    const DWORD overlayStyle=WS_EX_TOPMOST|WS_EX_NOACTIVATE|WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOREDIRECTIONBITMAP|(wcsstr(args,L"--demo")?WS_EX_APPWINDOW:WS_EX_TOOLWINDOW);
     overlay=CreateWindowExW(overlayStyle,L"EdgeZoomOverlay",L"EdgeZoom",WS_POPUP|WS_CLIPCHILDREN,0,0,1,1,nullptr,nullptr,h,nullptr);
     if(!settings||!overlay)return 1;
-    mouseHook=SetWindowsHookExW(WH_MOUSE_LL,mouseProc,h,0);
-    if(!mouseHook){MessageBoxW(settings,L"Could not register the mouse-wheel shortcut.",L"EdgeZoom",MB_OK|MB_ICONERROR);return 1;}
+    SetLayeredWindowAttributes(overlay,0,255,LWA_ALPHA);
+    smoke=wcsstr(args,L"--smoke-test")!=nullptr;
+    if(!input.open(settings,ZOOM,STOP)){
+        MessageBoxW(settings,L"Could not register the input shortcuts.",L"EdgeZoom",MB_OK|MB_ICONERROR);return 1;
+    }
     taskbarCreated=RegisterWindowMessageW(L"TaskbarCreated");tray();
     RegisterHotKey(settings,1,MOD_CONTROL|MOD_ALT|MOD_NOREPEAT,'Q');
     if(!wcsstr(args,L"--tray")||!trayAdded){ShowWindow(settings,SW_SHOWNORMAL);UpdateWindow(settings);}
+    if(!smoke&&!wcsstr(args,L"--demo"))SetTimer(settings,20,50,nullptr);
     if(wcsstr(args,L"--demo")||wcsstr(args,L"--smoke-test"))SetTimer(settings,9,350,nullptr);
     if(wcsstr(args,L"--smoke-test")){
         smoke=true;SetTimer(settings,11,2500,nullptr);SetTimer(settings,12,4400,nullptr);
         SetTimer(settings,13,4800,nullptr);SetTimer(settings,10,5100,nullptr);
         smokeStarted=GetTickCount64();SetTimer(settings,14,7,nullptr);
+        SetTimer(settings,15,3200,nullptr);SetTimer(settings,16,3400,nullptr);
+        SetTimer(settings,17,3550,nullptr);SetTimer(settings,18,3700,nullptr);SetTimer(settings,19,3900,nullptr);
     }
     MSG msg{};BOOL result;
     while((result=GetMessageW(&msg,nullptr,0,0))>0){
         if(!active&&IsDialogMessageW(settings,&msg))continue;
         TranslateMessage(&msg);DispatchMessageW(&msg);
     }
-    stop();if(mouseHook)UnhookWindowsHookEx(mouseHook);
+    stop();input.close();
     DestroyWindow(overlay);DeleteObject(font);if(mutex)CloseHandle(mutex);
     return result<0?1:int(msg.wParam);
 }

@@ -76,6 +76,14 @@ int Capture::next(ComPtr<ID3D11Texture2D>& texture){
     HRESULT hr=state->pool->TryGetNextFrame(&state->frame);
     if(FAILED(hr))return -1;
     if(!state->frame)return 0;
+    // Drain the bounded frame pool. Present the newest completed desktop,
+    // not the oldest queued image after input or a busy application tick.
+    for(int i=0;i<4;++i){
+        ComPtr<GC::IDirect3D11CaptureFrame> newer;
+        if(FAILED(state->pool->TryGetNextFrame(&newer)))return -1;
+        if(!newer)break;
+        closeObject(state->frame.Get());state->frame=newer;
+    }
     ABI::Windows::Graphics::SizeInt32 size{};
     if(FAILED(state->frame->get_ContentSize(&size))||size.Width!=INT32(state->width)||size.Height!=INT32(state->height))return -1;
     ComPtr<D3D::IDirect3DSurface> surface;

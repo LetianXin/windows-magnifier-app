@@ -16,7 +16,7 @@ float4 PS(V input):SV_TARGET {
     return screenImage.Sample(sampling,input.uv);
 })";
 }
-bool Renderer::open(HWND host,RECT monitor,bool diagnostic){
+bool Renderer::open(HWND host,RECT monitor,bool diagnostic,bool begin){
     close();bounds=monitor;
     // Windows 10 2004+ excludes this window from capture. No hide /
     // recapture / show loop is ever used, and no pointer shape is composited.
@@ -46,7 +46,16 @@ bool Renderer::open(HWND host,RECT monitor,bool diagnostic){
     sd.Format=DXGI_FORMAT_B8G8R8A8_UNORM;sd.SampleDesc.Count=1;
     sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;sd.BufferCount=2;
     sd.SwapEffect=DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;sd.AlphaMode=DXGI_ALPHA_MODE_IGNORE;
-    if(FAILED(factory2->CreateSwapChainForHwnd(device.Get(),host,&sd,nullptr,nullptr,&swap)))return false;
+    sd.Flags=DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    if(FAILED(factory2->CreateSwapChainForComposition(device.Get(),&sd,nullptr,&swap)))return false;
+    Ptr<IDXGISwapChain2> swap2;
+    if(FAILED(swap.As(&swap2))||FAILED(swap2->SetMaximumFrameLatency(1)))return false;
+    frameReady=swap2->GetFrameLatencyWaitableObject();if(!frameReady)return false;
+    Ptr<IDXGIDevice> dxgiDevice;
+    if(FAILED(device.As(&dxgiDevice))||FAILED(DCompositionCreateDevice(dxgiDevice.Get(),IID_PPV_ARGS(&composition)))||
+       FAILED(composition->CreateTargetForHwnd(host,TRUE,&compositionTarget))||
+       FAILED(composition->CreateVisual(&compositionVisual))||FAILED(compositionVisual->SetContent(swap.Get()))||
+       FAILED(compositionTarget->SetRoot(compositionVisual.Get()))||FAILED(composition->Commit()))return false;
     factory2->MakeWindowAssociation(host,DXGI_MWA_NO_ALT_ENTER);
     if(FAILED(swap->GetBuffer(0,IID_PPV_ARGS(&backBuffer)))||FAILED(device->CreateRenderTargetView(backBuffer.Get(),nullptr,&target)))return false;
     Ptr<ID3DBlob> vs,ps;
@@ -64,12 +73,13 @@ bool Renderer::open(HWND host,RECT monitor,bool diagnostic){
         td.Format=DXGI_FORMAT_B8G8R8A8_UNORM;td.SampleDesc.Count=1;td.Usage=D3D11_USAGE_STAGING;td.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
         if(FAILED(device->CreateTexture2D(&td,nullptr,&probeTexture)))return false;
     }
-    if(!captureSource.open(device.Get(),wanted,sd.Width,sd.Height))return false;
-    // Do not show an empty overlay if the first desktop frame is unavailable.
-    const auto deadline=GetTickCount64()+1000;
-    while(!hasFrame&&GetTickCount64()<deadline){if(capture()<0)return false;if(!hasFrame)Sleep(2);}
-    return hasFrame;
+    return !begin||beginCapture();
 }
+bool Renderer::beginCapture(){
+    return device&&captureSource.open(device.Get(),MonitorFromRect(&bounds,MONITOR_DEFAULTTONEAREST),
+        bounds.right-bounds.left,bounds.bottom-bounds.top);
+}
+void Renderer::endCapture(){captureSource.close();hasFrame=hasView=pending=false;}
 int Renderer::capture(){
     Ptr<ID3D11Texture2D> frame;
     const int result=captureSource.next(frame);
@@ -86,7 +96,11 @@ int Renderer::capture(){
 }
 bool Renderer::update(const ez::View& v){
     int fresh=capture();if(fresh<0)return false;
-    if(!fresh&&hasView&&v.scale==previous.scale&&v.x==previous.x&&v.y==previous.y)return true;
+    pending=pending||fresh>0;
+    if(!hasFrame)return true;
+    if(!pending&&hasView&&v.scale==previous.scale&&v.x==previous.x&&v.y==previous.y)return true;
+    // Never block the message loop on vsync or build a queue of stale frames.
+    if(WaitForSingleObject(frameReady,0)!=WAIT_OBJECT_0)return true;
     float values[4]={float(v.x/v.width),float(v.y/v.height),float(1/v.scale),float(1/v.scale)};
     context->UpdateSubresource(constants.Get(),0,nullptr,values,0,0);
     ID3D11RenderTargetView* rt=target.Get();context->OMSetRenderTargets(1,&rt,nullptr);
@@ -99,9 +113,10 @@ bool Renderer::update(const ez::View& v){
     context->Draw(3,0);
     // Test the frame just drawn, BEFORE Present rotates the back buffers.
     if(probeTexture){D3D11_BOX box{32,32,0,33,33,1};context->CopySubresourceRegion(probeTexture.Get(),0,0,0,0,backBuffer.Get(),0,&box);}
-    HRESULT hr=swap->Present(1,0);
+    HRESULT hr=swap->Present(0,DXGI_PRESENT_DO_NOT_WAIT);
+    if(hr==DXGI_ERROR_WAS_STILL_DRAWING)return true;
     if(FAILED(hr))return false;
-    previous=v;hasView=hr==S_OK;return true;
+    previous=v;hasView=hr==S_OK;pending=false;return true;
 }
 COLORREF Renderer::probe(){
     if(!hasView||!probeTexture)return CLR_INVALID;
@@ -113,6 +128,9 @@ void Renderer::close(){
     captureSource.close();
     if(context){context->ClearState();context->Flush();}
     image.Reset();desktop.Reset();target.Reset();backBuffer.Reset();probeTexture.Reset();
-    constants.Reset();sampler.Reset();vertex.Reset();pixel.Reset();swap.Reset();context.Reset();device.Reset();
+    constants.Reset();sampler.Reset();vertex.Reset();pixel.Reset();
+    compositionVisual.Reset();compositionTarget.Reset();composition.Reset();swap.Reset();
+    if(frameReady){CloseHandle(frameReady);frameReady=nullptr;}
+    context.Reset();device.Reset();
     hasView=hasFrame=false;
 }
