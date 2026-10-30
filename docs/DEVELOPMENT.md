@@ -1,4 +1,4 @@
-# EdgeZoom 0.4 development notes
+# EdgeZoom 0.5 development notes
 
 ## Rendering
 
@@ -10,11 +10,11 @@ The overlay is marked `WDA_EXCLUDEFROMCAPTURE` before capture starts, preventing
 
 ## Input and tray
 
-Holding the configured activation button and scrolling up starts zoom. Releasing it or pressing Escape dismisses it. The default is Alt; pressing Alt without scrolling retains its usual behavior. The mouse-wheel hook does no capture or rendering work: it posts a message to the app's event loop. Raw mouse input is registered only during inspection.
+Holding the configured activation button and scrolling up starts zoom. Releasing it preserves live zoom and edge panning. Hold it again to adjust with the wheel; return to 100% or press Escape to dismiss zoom. The default is Alt; pressing Alt without scrolling retains its usual behavior. The mouse-wheel hook does no capture or rendering work: it posts a message to the app's event loop. Raw mouse input is registered only during inspection.
 
 The edge-push rule requires outward relative mouse motion after the pointer has arrived at a boundary. A stationary pointer never pans. Pan offsets are original-desktop pixels and are no longer divided by the zoom scale. Tests check the same displacement at 2x, 4x, 8x and 16x. Raw movement is independent of Windows pointer acceleration; custom pointer-speed/acceleration settings can affect how closely its physical feel matches the desktop pointer.
 
-The prior cursor clipping rectangle is restored on release. The overlay is for inspection; release the activation button before interacting with other apps.
+The prior cursor clipping rectangle is restored when zoom is dismissed. The overlay is for inspection; press Escape or return to 100% before interacting with other apps.
 
 A notification-area icon remains registered while the process runs. Windows may put it in the hidden-icons overflow. Left-click opens settings; right-click exposes Settings, Pause/Resume and Quit. Settings also has Pause and Quit buttons. Ctrl+Alt+Q quits when registration of that shortcut is available. If the tray cannot be registered, settings stays accessible instead of disappearing into the background. Restarting Explorer re-registers the tray icon.
 
@@ -26,7 +26,7 @@ See the repository README for Visual Studio/CMake and LLVM-MinGW commands. MSVC 
 
 `tests/view_test.cpp` checks anchored zoom, boundary arrival, resting at boundaries, all four outward directions, inward movement, source bounds, zoom limits, no drift, equal original-desktop displacement at different scales, and 1,000 mixed operations. Assertions remain enabled in Release builds. CI runs these tests without an interactive desktop.
 
-Quit any existing instance before running `EdgeZoom.exe --smoke-test` locally. The test creates an independent synthetic source window, magnifies it, changes its content, and samples rendered output repeatedly while panning. Samples are taken from a 1-pixel GPU staging texture copied immediately before Present, avoiding a false reading from a different back buffer after a swap. This diagnostic readback is absent from ordinary use. It also checks zoom changes, release, restored clipping, and tray registration. Normal mouse movement/wheel input is isolated from the scripted test; Escape can still cancel it.
+Quit any existing instance before running `EdgeZoom.exe --smoke-test` locally. The test creates an independent synthetic source window, magnifies it, changes its content, and samples rendered output repeatedly while panning. Samples are taken from a 1-pixel GPU staging texture copied immediately before Present, avoiding a false reading from a different back buffer after a swap. This diagnostic readback is absent from ordinary use. It also verifies persistent zoom without a held modifier, return to 100%, restored clipping, and tray registration. Normal mouse movement/wheel input is isolated from the scripted test; Escape can still cancel it.
 
 The test writes `EdgeZoom.ini.test.txt` beside the executable. It contains pass/fail information, synthetic pixel values, frame-sample counts and tray registration status, not screenshots or input history. Exit 0 means pass, 2/3 failure, and 4 means another instance prevented the test. `--demo` opens the animated synthetic source for manual inspection.
 

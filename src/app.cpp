@@ -23,7 +23,7 @@ HFONT font=nullptr;HHOOK mouseHook=nullptr;
 Renderer renderer;ez::View view;
 LiveFixture fixture;
 RECT monitorBounds{},oldClip{};POINT lastPointer{};
-bool active=false,practice=false,clipped=false,trayAdded=false;
+bool active=false,clipped=false,trayAdded=false;
 bool enabled=true;
 int binding=0;UINT taskbarCreated=0;std::wstring config;
 bool smoke=false,smokePass=false,renderHealthy=false;
@@ -39,7 +39,6 @@ void stop(){
     const bool restore=GetForegroundWindow()==overlay;
     ShowWindow(overlay,SW_HIDE);renderer.close();fixture.close();
     if(restore&&IsWindow(previousWindow))SetForegroundWindow(previousWindow);
-    practice=false;
 }
 void redraw(){
     wchar_t title[100];swprintf_s(title,L"EdgeZoom - %.2fx",view.scale);
@@ -64,7 +63,7 @@ bool start(bool test=false){
     RAWINPUTDEVICE raw{1,2,RIDEV_INPUTSINK,overlay};
     if(!RegisterRawInputDevices(&raw,1,sizeof(raw))){renderer.close();fixture.close();return false;}
     clipped=GetClipCursor(&oldClip)&&ClipCursor(&monitorBounds);
-    practice=test;active=true;
+    active=true;
     renderHealthy=renderer.update(view);
     if(!renderHealthy){stop();return false;}
     SetWindowPos(overlay,HWND_TOPMOST,monitorBounds.left,monitorBounds.top,w,h,SWP_SHOWWINDOW);
@@ -76,13 +75,17 @@ void zoom(int delta){
     if(!start())return;
     POINT p;GetCursorPos(&p);ScreenToClient(overlay,&p);
     // Immediate pointer-anchored zoom: no easing, timer scrolling, or inertia.
-    view.zoom(view.scale*std::pow(1.2,double(delta)/WHEEL_DELTA),p.x,p.y);redraw();
+    view.zoom(view.scale*std::pow(1.2,double(delta)/WHEEL_DELTA),p.x,p.y);
+    if(view.scale<=1){stop();return;}
+    redraw();
 }
 LRESULT CALLBACK mouseProc(int code,WPARAM message,LPARAM data){
-    if(!smoke&&code==HC_ACTION&&message==WM_MOUSEWHEEL&&(active||(enabled&&held()))){
+    // The modifier gates wheel zoom only. Releasing it leaves the viewport active.
+    if(!smoke&&code==HC_ACTION&&message==WM_MOUSEWHEEL&&enabled&&held()){
         const auto* event=reinterpret_cast<const MSLLHOOKSTRUCT*>(data);
         const int delta=GET_WHEEL_DELTA_WPARAM(event->mouseData);
-        if(active||delta>0){PostMessageW(settings,ZOOM,WPARAM(delta),0);return 1;}
+        if(active||delta>0)PostMessageW(settings,ZOOM,WPARAM(delta),0);
+        return 1;
     }
     return CallNextHookEx(mouseHook,code,message,data);
 }
@@ -105,15 +108,14 @@ LRESULT CALLBACK OverlayProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
     case WM_PAINT:{PAINTSTRUCT p;BeginPaint(w,&p);EndPaint(w,&p);return 0;}
     case WM_INPUT:rawMouse(reinterpret_cast<HRAWINPUT>(lp));return DefWindowProcW(w,m,wp,lp);
     case WM_TIMER:
-        if(active&&!practice&&!held())stop();
-        else if(active){renderHealthy=renderer.update(view);if(!renderHealthy)stop();}
+        if(active){renderHealthy=renderer.update(view);if(!renderHealthy)stop();}
         return 0;
     case WM_KEYDOWN:case WM_SYSKEYDOWN:
         if(wp==VK_ESCAPE){stop();return 0;}
         // Normal system switching remains available while inspecting.
         if(wp==VK_TAB){stop();return DefWindowProcW(w,m,wp,lp);}
         return 0;
-    case WM_KEYUP:case WM_SYSKEYUP:if(!practice&&!held())stop();return 0;
+    case WM_KEYUP:case WM_SYSKEYUP:return 0;
     case WM_ACTIVATE:if(LOWORD(wp)==WA_INACTIVE&&active)stop();return 0;
     case WM_DISPLAYCHANGE:case WM_CLOSE:stop();return 0;
     case WM_SETCURSOR:SetCursor(LoadCursorW(nullptr,IDC_ARROW));return TRUE;
@@ -153,7 +155,7 @@ LRESULT CALLBACK SettingsProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
         HWND combo=control(w,L"COMBOBOX",L"",CBS_DROPDOWNLIST|WS_TABSTOP|WS_VSCROLL,20,48,350,240,KEYBOX);
         for(auto b:bindings)SendMessageW(combo,CB_ADDSTRING,0,(LPARAM)b.label);
         SendMessageW(combo,CB_SETCURSEL,binding,0);
-        control(w,L"STATIC",L"Push beyond an edge to pan at normal speed.\nRelease the button to return. Esc also exits.\nThe screen stays live while you hold.\n\nTray icon: Pause / Quit   |   Ctrl+Alt+Q: quit",0,20,92,350,110,0);
+        control(w,L"STATIC",L"Release the button: keep zoom, keep panning.\nHold it again + scroll to adjust the zoom.\nZoom down to 100% or press Esc to return.\n\nTray icon: Pause / Quit   |   Ctrl+Alt+Q: quit",0,20,92,350,110,0);
         control(w,L"BUTTON",L"Done - keep in tray",WS_TABSTOP|BS_DEFPUSHBUTTON,20,218,176,34,DONE);
         control(w,L"BUTTON",L"Pause",WS_TABSTOP,204,218,78,34,PAUSE);
         control(w,L"BUTTON",L"Quit",WS_TABSTOP,290,218,80,34,QUIT);
@@ -194,9 +196,15 @@ LRESULT CALLBACK SettingsProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
         if(wp==12){
             KillTimer(w,12);smokeChecks|=(active?16:0)|(fixture.displayed(renderer.probe())?32:0);secondProbe=fixture.lastProbe;
             zoom(120);smokeChecks|=std::abs(view.scale-2.4)<1e-6?64:0;
-            practice=false; // Exercise the real release timer with no activation key held.
         }
-        if(wp==13){KillTimer(w,13);RECT clip{};GetClipCursor(&clip);smokeChecks|=(!active?128:0)|(EqualRect(&clip,&oldClip)?256:0);}
+        if(wp==13){
+            KillTimer(w,13);
+            // No activation key is held: zoom must remain live until explicitly
+            // scrolled back to 100%, which must restore normal cursor boundaries.
+            smokeChecks|=(active&&std::abs(view.scale-2.4)<1e-6)?128:0;
+            zoom(-2400);RECT clip{};GetClipCursor(&clip);
+            smokeChecks|=(!active&&EqualRect(&clip,&oldClip))?256:0;
+        }
         if(wp==10){
             smokePass=smokeChecks==511&&frameSamples>=10&&badFrames==0&&trayAdded;
             if(smoke){
