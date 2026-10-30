@@ -1,0 +1,52 @@
+#pragma once
+#include <windows.h>
+#include <string>
+
+// Only used by --demo/--smoke-test. Real desktop windows are never modified.
+// The left quarter is gray; a 2x centered view samples the colored area instead.
+// Checking that displayed color twice proves both magnification and liveness.
+class LiveFixture {
+    HWND window=nullptr;
+    RECT bounds{};
+    int phase=0;
+    static COLORREF color(int phase){return phase%2?RGB(176,64,48):RGB(32,144,112);}
+    static LRESULT CALLBACK proc(HWND w,UINT m,WPARAM wp,LPARAM lp){
+        auto* self=reinterpret_cast<LiveFixture*>(GetWindowLongPtrW(w,GWLP_USERDATA));
+        if(m==WM_NCCREATE){self=static_cast<LiveFixture*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);SetWindowLongPtrW(w,GWLP_USERDATA,(LONG_PTR)self);}
+        if(self&&m==WM_TIMER){self->phase++;InvalidateRect(w,nullptr,FALSE);return 0;}
+        if(self&&m==WM_PAINT){
+            PAINTSTRUCT p;HDC dc=BeginPaint(w,&p);RECT r;GetClientRect(w,&r);
+            HBRUSH brush=CreateSolidBrush(color(self->phase));FillRect(dc,&r,brush);DeleteObject(brush);
+            RECT left=r;left.right=r.right/4;FillRect(dc,&left,(HBRUSH)GetStockObject(GRAY_BRUSH));
+            SetBkMode(dc,TRANSPARENT);SetTextColor(dc,RGB(255,255,255));
+            std::wstring title=L"LIVE FRAME "+std::to_wstring(self->phase)+L" - the background changes while zoom stays still";
+            TextOutW(dc,r.right/4+60,r.bottom/4+70,title.c_str(),int(title.size()));
+            EndPaint(w,&p);return 0;
+        }
+        return DefWindowProcW(w,m,wp,lp);
+    }
+public:
+    COLORREF lastProbe=CLR_INVALID;
+    bool open(RECT monitor,bool animate){
+        close();bounds=monitor;phase=0;
+        WNDCLASSW c{};c.hInstance=GetModuleHandleW(nullptr);c.lpfnWndProc=proc;c.lpszClassName=L"EdgeZoomLiveFixture";
+        RegisterClassW(&c);
+        window=CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,c.lpszClassName,L"EdgeZoom live test source",WS_POPUP,
+            monitor.left,monitor.top,monitor.right-monitor.left,monitor.bottom-monitor.top,nullptr,nullptr,c.hInstance,this);
+        if(!window)return false;
+        ShowWindow(window,SW_SHOWNOACTIVATE);UpdateWindow(window);
+        if(animate)SetTimer(window,1,500,nullptr);
+        return true;
+    }
+    void advance(){++phase;InvalidateRect(window,nullptr,FALSE);UpdateWindow(window);}
+    bool displayed(){
+        HDC dc=GetDC(nullptr);if(!dc)return false;
+        COLORREF actual=GetPixel(dc,bounds.left+32,bounds.top+32);ReleaseDC(nullptr,dc);
+        lastProbe=actual;
+        COLORREF expected=color(phase);
+        return actual!=CLR_INVALID&&abs(int(GetRValue(actual))-int(GetRValue(expected)))<12
+            &&abs(int(GetGValue(actual))-int(GetGValue(expected)))<12
+            &&abs(int(GetBValue(actual))-int(GetBValue(expected)))<12;
+    }
+    void close(){if(window){DestroyWindow(window);window=nullptr;}}
+};

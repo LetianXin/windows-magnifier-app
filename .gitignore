@@ -426,3 +426,12 @@ FodyWeavers.xsd
 
 # Official VS Code C# Dev Kit Extension exclusion
 #*.lscache
+
+# EdgeZoom local builds and user settings
+/build*/
+/out/
+EdgeZoom.ini
+EdgeZoom.ini.test.txt
+*.log
+.env
+.env.*
